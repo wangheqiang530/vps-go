@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 一键升级 x-ui 和 s-ui 面板脚本
-# 用法: 保存为 panels_update.sh，然后 chmod +x panels_update.sh && ./panels_update.sh
+# 用法: 保存为 update_panels.sh，然后 chmod +x update_panels.sh && ./update_panels.sh
 
 echo "=== 开始检测和升级面板 ==="
 
@@ -64,3 +64,7 @@ else
 fi
 
 echo "=== 结束 ==="
+
+# 新增：JSON格式总结（用于批量解析）
+json_summary='{"xui_detected": "'$xui_detected'", "xui_updated": "'$xui_updated'", "sui_detected": "'$sui_detected'", "sui_updated": "'$sui_updated'"}'
+echo "$json_summary"
