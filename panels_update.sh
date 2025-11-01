@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 一键升级 x-ui 和 s-ui 面板脚本
-# 用法: 保存为 update_panels.sh，然后 chmod +x update_panels.sh && ./update_panels.sh
+# 用法: 保存为 panels_update.sh，然后 chmod +x panels_update.sh && ./panels_update.sh
 
 echo "=== 开始检测和升级面板 ==="
 
