@@ -170,21 +170,55 @@ old_compose="N/A"
 new_compose="集成在 Docker CE (v2.x)"
 RESULTS["Docker Compose"]="安装|$old_compose|$new_compose"
 
+# 第八步: 系统清理（清理依赖、垃圾文件、过时组件）
+log "执行系统清理..."
+old_space=$(df / | awk 'NR==2 {print $4}')  # 可用空间（KB）
+clean_cmds=(
+    "apt autoremove -y"  # 移除不再需要的依赖
+    "apt autoclean"     # 清理旧包缓存
+    "apt clean"         # 清空包缓存
+)
+if command -v docker >/dev/null 2>&1; then
+    clean_cmds+=("docker system prune -f")  # 清理Docker无用镜像/容器/网络/卷
+fi
+clean_cmds+=(
+    "journalctl --vacuum-time=2weeks"  # 清理系统日志（保留2周）
+    "rm -rf /tmp/* /var/tmp/*"         # 清理临时文件
+)
+cleanup_success=true
+for cmd in "${clean_cmds[@]}"; do
+    if eval "$cmd" 2>/dev/null; then
+        log "$cmd 清理成功"
+    else
+        warn "$cmd 清理失败或无变化"
+        cleanup_success=false
+    fi
+done
+new_space=$(df / | awk 'NR==2 {print $4}')
+space_freed=$((old_space - new_space))
+if [[ $space_freed -lt 0 ]]; then space_freed=0; fi
+RESULTS["系统清理"]=$([[ "$cleanup_success" == true ]] && echo "清理|N/A|释放 ${space_freed}KB" || echo "部分清理|N/A|释放 ${space_freed}KB")
+
 # 总结输出: 表格
 echo ""
 log "=== 安装/升级结果总结 ==="
-printf "%-25s %-10s %-20s %-20s\n" "项目" "状态" "之前版本" "现在版本"
+printf "%-20s %-5s %-25s %-25s\n" "项目" "状态" "之前版本" "现在版本"
 printf "%s\n" "------------------------------------------------------------------------------------------"
 for key in "${!RESULTS[@]}"; do
     IFS='|' read -r status old new <<< "${RESULTS[$key]}"
     if [[ "$status" == "失败" ]]; then
         color="${RED}"
-    elif [[ "$status" == "已设置" ]]; then
-        color="${GREEN}"
     else
         color="${GREEN}"
     fi
-    printf "${color}%-25s %-10s %-20s %-20s${NC}\n" "$key" "$status" "$old" "$new"
+    # 检查是否升级且版本不同
+    if [[ "$status" == "升级" && "$old" != "$new" && "$old" != "N/A" && "$old" != "未知" && "$old" != *"未安装"* ]]; then
+        new_color="${YELLOW}"
+    else
+        new_color=""
+    fi
+    printf "${color}%-20s %-5s %-25s${NC}" "$key" "$status" "$old"
+    printf "${new_color}%-25s${NC}\n" "$new"
 done
 
 # 统计（修复版：正确计数成功项目）
