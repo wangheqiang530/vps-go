@@ -179,7 +179,8 @@ clean_cmds=(
     "apt clean"         # 清空包缓存
 )
 if command -v docker >/dev/null 2>&1; then
-    clean_cmds+=("docker system prune -f")  # 清理Docker无用镜像/容器/网络/卷
+    clean_cmds+=("docker image prune -f")  # 清理未使用的镜像
+    clean_cmds+=("docker builder prune -f")  # 清理构建缓存
 fi
 clean_cmds+=(
     "journalctl --vacuum-time=2weeks"  # 清理系统日志（保留2周）
