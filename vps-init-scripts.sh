@@ -208,14 +208,15 @@ for key in "${!RESULTS[@]}"; do
     IFS='|' read -r status old new <<< "${RESULTS[$key]}"
     if [[ "$status" == "失败" ]]; then
         color="${RED}"
+        new_color="${RED}"
     else
         color="${GREEN}"
-    fi
-    # 检查是否升级且版本不同
-    if [[ "$status" == "升级" && "$old" != "$new" && "$old" != "N/A" && "$old" != "未知" && "$old" != *"未安装"* ]]; then
-        new_color="${YELLOW}"
-    else
-        new_color=""
+        # 检查是否版本无变动（绿色）或有变动（黄色）
+        if [[ "$status" == "升级" && "$old" == "$new" ]] || [[ "$status" == "已设置" ]]; then
+            new_color="${GREEN}"
+        else
+            new_color="${YELLOW}"
+        fi
     fi
     printf "${color}%-20s %-5s %-25s${NC}" "$key" "$status" "$old"
     printf "${new_color}%-25s${NC}\n" "$new"
