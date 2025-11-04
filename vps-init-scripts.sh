@@ -195,7 +195,7 @@ for cmd in "${clean_cmds[@]}"; do
     fi
 done
 new_space=$(df / | awk 'NR==2 {print $4}')
-space_freed=$((old_space - new_space))
+space_freed=$((new_space - old_space))
 if [[ $space_freed -lt 0 ]]; then space_freed=0; fi
 RESULTS["系统清理"]=$([[ "$cleanup_success" == true ]] && echo "清理|N/A|释放 ${space_freed}KB" || echo "部分清理|N/A|释放 ${space_freed}KB")
 
