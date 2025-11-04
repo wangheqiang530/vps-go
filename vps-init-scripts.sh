@@ -195,9 +195,17 @@ for cmd in "${clean_cmds[@]}"; do
     fi
 done
 new_space=$(df / | awk 'NR==2 {print $4}')
-space_freed=$((new_space - old_space))
-if [[ $space_freed -lt 0 ]]; then space_freed=0; fi
-RESULTS["系统清理"]=$([[ "$cleanup_success" == true ]] && echo "清理|N/A|释放 ${space_freed}KB" || echo "部分清理|N/A|释放 ${space_freed}KB")
+space_freed_kb=$((new_space - old_space))
+if [[ $space_freed_kb -lt 0 ]]; then space_freed_kb=0; fi
+space_freed_mb=$((space_freed_kb / 1024))
+space_freed_remainder=$((space_freed_kb % 1024))
+if [[ $space_freed_mb -gt 0 ]]; then
+    space_detail="${space_freed_mb}MB"
+    [[ $space_freed_remainder -gt 0 ]] && space_detail+="+${space_freed_remainder}KB"
+else
+    space_detail="${space_freed_kb}KB"
+fi
+RESULTS["系统清理"]=$([[ "$cleanup_success" == true ]] && echo "清理|N/A|释放 $space_detail" || echo "部分清理|N/A|释放 $space_detail")
 
 # 总结输出: 表格
 echo ""
