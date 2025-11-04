@@ -155,8 +155,16 @@ if apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin doc
     fi
     RESULTS["Docker"]="$action|$old_docker|$new_docker"
     log "Docker $action 成功 (从 $old_docker 到 $new_docker)"
+    # 配置 Docker 使用 nftables（避免 iptables 冲突）
+    cat > /etc/docker/daemon.json << EOF
+    {
+      "iptables": false,
+      "ip6tables": false
+    }
+    EOF
+    log "配置 Docker daemon.json 以兼容 nftables"
     systemctl enable docker 2>/dev/null || true
-    systemctl start docker 2>/dev/null || true
+    systemctl restart docker  # 重启以应用配置
     # 添加当前用户到 docker 组（如果适用）
     usermod -aG docker $SUDO_USER 2>/dev/null || true
 else
