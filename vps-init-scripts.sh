@@ -163,6 +163,42 @@ if apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin doc
 }
 EOF
     log "配置 Docker daemon.json 以兼容 nftables"
+    # 添加 Docker nftables 兼容规则
+    log "配置 nftables 以支持 Docker..."
+    WAN_IFACE=$(ip route show default | awk '/default/ {print $5; exit}' | head -1)
+    if [[ -n "$WAN_IFACE" ]]; then
+        cat >> /etc/nftables.conf << EOF
+
+# Docker 兼容规则（由 vps-init-scripts.sh 生成）
+table inet filter {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        ct state established,related accept
+        ct state invalid drop;
+        iifname "docker0" oifname "$WAN_IFACE" accept
+        iifname "$WAN_IFACE" oifname "docker0" accept
+    }
+}
+
+table inet nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "$WAN_IFACE" masquerade;
+    }
+}
+EOF
+        if nft -f /etc/nftables.conf 2>/dev/null; then
+            systemctl restart nftables 2>/dev/null || true
+            RESULTS["Docker nftables"]="配置|N/A|已添加 (接口: $WAN_IFACE)"
+            log "nftables Docker 规则已加载成功 (接口: $WAN_IFACE)"
+        else
+            RESULTS["Docker nftables"]="部分配置|N/A|规则生成但加载失败 (手动检查 /etc/nftables.conf)"
+            warn "nftables 规则生成成功，但加载失败。请手动运行: sudo nft -f /etc/nftables.conf"
+        fi
+    else
+        RESULTS["Docker nftables"]="跳过|N/A|未检测到 WAN 接口"
+        warn "未检测到 WAN 接口，跳过 nftables Docker 配置"
+    fi
     systemctl enable docker 2>/dev/null || true
     systemctl restart docker  # 重启以应用配置
     # 添加当前用户到 docker 组（如果适用）
