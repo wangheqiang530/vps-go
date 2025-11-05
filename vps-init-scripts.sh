@@ -130,9 +130,9 @@ if apt install -y fail2ban 2>/dev/null; then
 backend = systemd
 banaction = nftables-multiport
 allowipv6 = auto
-bantime = 3600
-findtime = 600
-maxretry = 5
+bantime = 24h
+findtime = 10m
+maxretry = 3
 
 [Definition]
 allowipv6 = auto
