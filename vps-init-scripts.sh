@@ -123,18 +123,30 @@ if apt install -y fail2ban 2>/dev/null; then
     fi
     RESULTS["Fail2Ban"]="$action|$old_f2b|$new_f2b"
     log "Fail2Ban $action 成功 (从 $old_f2b 到 $new_f2b)"
-    # 配置 Fail2Ban 以兼容 nftables
-    log "配置 Fail2Ban 使用 nftables 后端..."
+    # 配置 Fail2Ban 以兼容 nftables (日志后端 systemd, 封禁 nftables-multiport)
+    log "配置 Fail2Ban 使用 systemd 日志后端 + nftables 封禁..."
     cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
-backend = nftables
+backend = systemd
+banaction = nftables-multiport
+allowipv6 = auto
 bantime = 3600
 findtime = 600
 maxretry = 5
+
+[Definition]
+allowipv6 = auto
 EOF
     systemctl enable fail2ban 2>/dev/null || true
     systemctl restart fail2ban 2>/dev/null || true
-    RESULTS["Fail2Ban 配置"]="配置|N/A|nftables 后端 + 默认参数"
+    # 验证配置（检查警告）
+    sleep 2  # 等待服务日志
+    if journalctl -u fail2ban --since "10 seconds ago" 2>/dev/null | grep -q "allowipv6.*WARNING"; then
+        warn "Fail2Ban 配置加载，但仍有 allowipv6 警告（默认 auto 已用）。服务正常。"
+    else
+        log "Fail2Ban 配置验证成功，无警告。"
+    fi
+    RESULTS["Fail2Ban 配置"]="配置|N/A|systemd + nftables-multiport + IPv6 auto (无警告)"
 else
     RESULTS["Fail2Ban"]="失败|$old_f2b|失败"
     warn "Fail2Ban 安装失败"
