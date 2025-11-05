@@ -123,8 +123,18 @@ if apt install -y fail2ban 2>/dev/null; then
     fi
     RESULTS["Fail2Ban"]="$action|$old_f2b|$new_f2b"
     log "Fail2Ban $action 成功 (从 $old_f2b 到 $new_f2b)"
+    # 配置 Fail2Ban 以兼容 nftables
+    log "配置 Fail2Ban 使用 nftables 后端..."
+    cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+backend = nftables
+bantime = 3600
+findtime = 600
+maxretry = 5
+EOF
     systemctl enable fail2ban 2>/dev/null || true
-    systemctl start fail2ban 2>/dev/null || true
+    systemctl restart fail2ban 2>/dev/null || true
+    RESULTS["Fail2Ban 配置"]="配置|N/A|nftables 后端 + 默认参数"
 else
     RESULTS["Fail2Ban"]="失败|$old_f2b|失败"
     warn "Fail2Ban 安装失败"
@@ -159,10 +169,11 @@ if apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin doc
     cat > /etc/docker/daemon.json << 'EOF'
 {
   "iptables": false,
-  "ip6tables": false
+  "ip6tables": false,
+  "dns": ["8.8.8.8", "114.114.114.114"]
 }
 EOF
-    log "配置 Docker daemon.json 以兼容 nftables"
+    log "配置 Docker daemon.json 以兼容 nftables + DNS 优化"
     # 添加 Docker nftables 兼容规则
     log "配置 nftables 以支持 Docker..."
     WAN_IFACE=$(ip route show default | awk '/default/ {print $5; exit}' | head -1)
