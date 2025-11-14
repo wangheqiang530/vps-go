@@ -10,3 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/wangheqiang530/vps-go/refs/heads/ma
 ```
 curl -fsSL https://raw.githubusercontent.com/wangheqiang530/vps-go/refs/heads/main/install-ntpdate-daily.sh | bash
 ```
+---
+一键安装fail2ban，且对重复违规者开启惩罚模式。
+```
+curl -fsSL https://raw.githubusercontent.com/wangheqiang530/vps-go/refs/heads/main/install-config-fail2ban.sh | bash
+```
