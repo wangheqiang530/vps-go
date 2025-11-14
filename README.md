@@ -5,3 +5,8 @@ VPS各类脚本合集
 ```
 curl -fsSL https://raw.githubusercontent.com/wangheqiang530/vps-go/refs/heads/main/install-dnscrypt-universal.sh | bash
 ```
+---
+一键安装ntpdate，修改时区为Asia/Shanghai，每日定时ntp同步时间。
+```
+curl -fsSL https://raw.githubusercontent.com/wangheqiang530/vps-go/refs/heads/main/install-ntpdate-daily.sh | bash
+```
