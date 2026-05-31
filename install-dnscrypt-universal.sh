@@ -1,555 +1,500 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# ===================================================================
-# install-dnscrypt-auto.sh
-# 完整自动化脚本（非交互），会：
-#  - 检测发行版并选择 apt 或 GitHub Releases 安装 dnscrypt-proxy
-#  - 如果存在 dnsmasq，则直接卸载 (no backup) 并停止服务
-#  - 自动下载 v3 列表/.minisig 和 minisign.pub，提取 minisign_key 并写入配置
-#  - 处理端口占用（优先停止常见占用者，否则切换到备用回环地址）
-#  - 覆盖 /etc/resolv.conf 指向本地 dnscrypt，尝试写保护（chattr +i）
-#  - 安装每周维护脚本（/etc/cron.weekly），每周自动更新 v3 列表与签名
-#  - 完全无交互，可重复运行（幂等设计）
+# install-dnscrypt-universal.sh
+# 作用：为 Debian 11/12/13 精简 VPS 自动安装并配置 dnscrypt-proxy。
+# 设计目标：
+# - 自动安装所需 apt 依赖，无需手动补包。
+# - 不依赖 rsyslog、cron、NetworkManager 或 systemd-resolved。
+# - 不假设 IPv6 可用，默认只监听 IPv4 回环地址，避免 IPv6 bind 报错。
+# - 只有 dnscrypt-proxy 启动并通过解析测试后，才修改 /etc/resolv.conf。
+# - 使用 systemd timer 做健康检查，不依赖 cron.weekly。
 #
-# 注意：脚本会覆盖 /etc/dnscrypt-proxy/dnscrypt-proxy.toml 与 /etc/resolv.conf。
-# ===================================================================
+# 可选环境变量：
+#   DNSCRYPT_LISTEN_IPV4=127.0.2.1       本地监听地址
+#   DNSCRYPT_SERVERS=cloudflare,google   上游服务器名，逗号分隔
+#   LOCK_RESOLV=1                        写入 /etc/resolv.conf 后使用 chattr +i 锁定
 
-# ------------------------ 配色与日志 ------------------------
+DNSCRYPT_LISTEN_IPV4="${DNSCRYPT_LISTEN_IPV4:-127.0.2.1}"
+DNSCRYPT_SERVERS="${DNSCRYPT_SERVERS:-cloudflare,google}"
+LOCK_RESOLV="${LOCK_RESOLV:-0}"
+LOG_FILE="/var/log/dnscrypt-install.log"
+BACKUP_DIR="/root/dnscrypt-backup-$(date +%Y%m%d-%H%M%S)"
+TMP_DIR=""
+
 CSI='\033['
 COL_RESET="${CSI}0m"
-COL_INFO="${CSI}1;34m"   # 蓝
-COL_OK="${CSI}1;32m"     # 绿
-COL_WARN="${CSI}1;33m"   # 黄
-COL_ERR="${CSI}1;31m"    # 红
+COL_INFO="${CSI}1;34m"
+COL_OK="${CSI}1;32m"
+COL_WARN="${CSI}1;33m"
+COL_ERR="${CSI}1;31m"
 
-logfile="/var/log/dnscrypt-install.log"
-exec 3>&1 4>&2
-# 同时输出到 stdout/stderr 与日志
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$logfile" >&3; }
-info() { printf '%b %s%b\n' "$COL_INFO" "$*" "$COL_RESET" | tee -a "$logfile" >&3; }
-ok()   { printf '%b %s%b\n' "$COL_OK" "[OK] $*" "$COL_RESET" | tee -a "$logfile" >&3; }
-warn() { printf '%b %s%b\n' "$COL_WARN" "[WARN] $*" "$COL_RESET" | tee -a "$logfile" >&3; }
-err()  { printf '%b %s%b\n' "$COL_ERR" "[ERROR] $*" "$COL_RESET" | tee -a "$logfile" >&4; }
+log_line() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+info() { printf '%b[INFO]%b %s\n' "$COL_INFO" "$COL_RESET" "$*"; log_line "[INFO] $*"; }
+ok() { printf '%b[OK]%b %s\n' "$COL_OK" "$COL_RESET" "$*"; log_line "[OK] $*"; }
+warn() { printf '%b[WARN]%b %s\n' "$COL_WARN" "$COL_RESET" "$*"; log_line "[WARN] $*"; }
+err() { printf '%b[ERROR]%b %s\n' "$COL_ERR" "$COL_RESET" "$*" >&2; log_line "[ERROR] $*"; }
 
-# 以非交互方式运行（非 root 会退出）
-if [ "$(id -u)" -ne 0 ]; then
-  err "脚本必须以 root 用户运行"
-  exit 1
-fi
+cleanup() {
+  if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
 
-info "开始：dnscrypt 自动安装脚本（无交互模式）"
-log "日志文件：$logfile"
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "请以 root 身份运行脚本，例如：curl -fsSL URL | bash" >&2
+    exit 1
+  fi
+}
 
-# ------------------------ 基础工具检测并安装 ------------------------
-ensure_tools() {
-  local need=(curl wget jq tar ss systemctl grep sed awk)
-  local toinstall=()
-  for c in "${need[@]}"; do
-    if ! command -v "$c" >/dev/null 2>&1; then
-      toinstall+=("$c")
+require_debian_systemd() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    err "未找到 apt-get。此脚本仅面向 Debian/Ubuntu 系系统。"
+    exit 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    err "当前系统未运行 systemd。Debian 11/12/13 VPS 通常默认使用 systemd。"
+    exit 1
+  fi
+
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in
+      debian|ubuntu)
+        info "检测到系统：${PRETTY_NAME:-$ID}"
+        ;;
+      *)
+        warn "当前系统不是 Debian/Ubuntu：${PRETTY_NAME:-unknown}，继续尝试安装。"
+        ;;
+    esac
+  fi
+}
+
+backup_existing_files() {
+  mkdir -p "$BACKUP_DIR"
+
+  for item in \
+    /etc/dnscrypt-proxy \
+    /etc/systemd/system/dnscrypt-proxy.service \
+    /etc/systemd/system/dnscrypt-proxy.socket \
+    /etc/systemd/system/dnscrypt-proxy-healthcheck.service \
+    /etc/systemd/system/dnscrypt-proxy-healthcheck.timer \
+    /etc/resolv.conf; do
+    if [ -e "$item" ] || [ -L "$item" ]; then
+      cp -a "$item" "$BACKUP_DIR/" 2>/dev/null || true
     fi
   done
-  if [ ${#toinstall[@]} -gt 0 ]; then
-    info "检测到缺少工具：${toinstall[*]}，使用 apt 非交互安装..."
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${toinstall[@]}"
-  else
-    ok "必要工具已存在：${need[*]}"
-  fi
+
+  ok "已备份现有 DNSCrypt/DNS 配置到：$BACKUP_DIR"
 }
 
-# ------------------------ 识别系统 ------------------------
-detect_distro() {
-  local id ver
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    id="$ID" || id="unknown"
-    ver="$VERSION_ID" || ver="unknown"
-  else
-    id="unknown"; ver="unknown"
-  fi
-  printf '%s|%s' "$id" "$ver"
+install_dependencies() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  info "更新 apt 软件源"
+  apt-get update -y
+
+  info "安装 Debian 精简系统所需依赖"
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    jq \
+    tar \
+    gzip \
+    iproute2 \
+    bind9-dnsutils \
+    procps \
+    coreutils \
+    grep \
+    sed \
+    findutils \
+    e2fsprogs
+
+  ok "依赖安装完成"
 }
 
-# ------------------------ apt 安装尝试 ------------------------
-try_apt_install() {
-  info "尝试 apt 非交互安装 dnscrypt-proxy（若仓库提供）..."
-  apt-get update -y || true
-  if DEBIAN_FRONTEND=noninteractive apt-get install -y dnscrypt-proxy; then
-    ok "apt 安装 dnscrypt-proxy 成功"
-    return 0
-  else
-    warn "apt 无法安装 dnscrypt-proxy（包缺失或安装失败），将改用 GitHub Releases"
-    return 1
-  fi
-}
-
-# ------------------------ GitHub Releases 安装 ------------------------
 asset_regex_for_arch() {
   local arch="$1"
   case "$arch" in
-    x86_64|amd64)  echo 'linux_(x86_64|amd64|x86-64).*\.tar\.gz|linux_x86_64.*\.tar\.gz' ;;
-    aarch64|arm64) echo 'linux_(arm64|aarch64|arm-).*\.tar\.gz|linux_arm64.*\.tar\.gz' ;;
-    armv7l|armv7)  echo 'linux_(armv7|arm-).*\.tar\.gz|linux_armv7.*\.tar\.gz' ;;
-    i386|i686)     echo 'linux_(x86_32|i386|i486|i686).*\.tar\.gz|linux_x86_32.*\.tar\.gz' ;;
-    *)             echo '' ;;
+    x86_64|amd64)
+      printf '%s\n' '^dnscrypt-proxy-linux_x86_64-[0-9].*\.tar\.gz$'
+      ;;
+    aarch64|arm64)
+      printf '%s\n' '^dnscrypt-proxy-linux_arm64-[0-9].*\.tar\.gz$'
+      ;;
+    armv7l|armv6l|armhf|arm)
+      printf '%s\n' '^dnscrypt-proxy-linux_arm-[0-9].*\.tar\.gz$'
+      ;;
+    i386|i686)
+      printf '%s\n' '^dnscrypt-proxy-linux_i386-[0-9].*\.tar\.gz$|^dnscrypt-proxy-linux_x86-[0-9].*\.tar\.gz$'
+      ;;
+    *)
+      printf '%s\n' ''
+      ;;
   esac
 }
 
-install_from_github() {
-  info "从 GitHub Releases 下载并安装 dnscrypt-proxy（自动识别架构）"
-  local REPO="DNSCrypt/dnscrypt-proxy"
-  local API="https://api.github.com/repos/${REPO}/releases/latest"
-  local TMP
-  TMP=$(mktemp -d)
-  local ARCH
-  ARCH="$(uname -m)"
-  local RE
-  RE=$(asset_regex_for_arch "$ARCH")
-  if [ -z "$RE" ]; then
-    err "不支持的架构：$ARCH"
-    return 2
+install_dnscrypt_from_github() {
+  local repo="DNSCrypt/dnscrypt-proxy"
+  local api="https://api.github.com/repos/${repo}/releases/latest"
+  local arch re download_url archive bin_path example_path version
+
+  arch="$(uname -m)"
+  re="$(asset_regex_for_arch "$arch")"
+  if [ -z "$re" ]; then
+    err "不支持的 CPU 架构：$arch"
+    exit 1
   fi
 
-  # 获取 asset url
-  local ASSET_URL
-  ASSET_URL=$(curl -sSf "$API" | jq -r --arg re "$RE" '.assets[] | select(.name|test($re; "i")) | .browser_download_url' | head -n1 || true)
-  if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-    err "在 GitHub release 中未找到匹配的资产（regex=${RE}）"
-    rm -rf "$TMP" || true
-    return 3
+  TMP_DIR="$(mktemp -d)"
+  archive="$TMP_DIR/dnscrypt-proxy.tar.gz"
+
+  info "从 GitHub Releases 获取 dnscrypt-proxy 最新版本信息"
+  download_url="$(curl -fsSL "$api" | jq -r --arg re "$re" '.assets[] | select(.name | test($re; "i")) | .browser_download_url' | head -n 1 || true)"
+  if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+    err "未找到匹配当前架构的 dnscrypt-proxy Release 包，架构：$arch，匹配规则：$re"
+    exit 1
   fi
 
-  info "下载资产：$ASSET_URL"
-  wget -qO "$TMP"/dnscrypt-release.tar.gz "$ASSET_URL"
-  info "解压资产..."
-  tar -xzf "$TMP"/dnscrypt-release.tar.gz -C "$TMP"
-  info "查找 dnscrypt-proxy 可执行文件..."
-  local BINPATH
-  BINPATH=$(find "$TMP" -type f -name dnscrypt-proxy -perm /111 -print -quit || true)
-  if [ -z "$BINPATH" ]; then
-    BINPATH=$(find "$TMP" -type f -name dnscrypt-proxy -print -quit || true)
+  info "下载：$download_url"
+  curl -fL --retry 3 --connect-timeout 10 --max-time 120 -o "$archive" "$download_url"
+
+  info "解压 dnscrypt-proxy"
+  tar -xzf "$archive" -C "$TMP_DIR"
+
+  bin_path="$(find "$TMP_DIR" -type f -name dnscrypt-proxy -perm -111 -print -quit || true)"
+  if [ -z "$bin_path" ]; then
+    bin_path="$(find "$TMP_DIR" -type f -name dnscrypt-proxy -print -quit || true)"
   fi
-  if [ -z "$BINPATH" ]; then
-    err "release 包中未找到 dnscrypt-proxy 二进制"
-    find "$TMP" -maxdepth 3 -type f -print | sed -n '1,200p' >> "$logfile" || true
-    rm -rf "$TMP" || true
-    return 4
+  if [ -z "$bin_path" ]; then
+    err "Release 包中未找到 dnscrypt-proxy 可执行文件。"
+    exit 1
   fi
 
-  install -m 0755 "$BINPATH" /usr/local/bin/dnscrypt-proxy
-  ok "已安装 /usr/local/bin/dnscrypt-proxy"
+  install -m 0755 "$bin_path" /usr/local/bin/dnscrypt-proxy
+  version="$(/usr/local/bin/dnscrypt-proxy -version 2>/dev/null || true)"
+  ok "已安装 /usr/local/bin/dnscrypt-proxy ${version:+($version)}"
 
-  # systemd unit：优先使用 release 中的 unit，如果没有则创建默认 unit
-  if [ -d "$TMP/linux-systemd" ] && [ -f "$TMP/linux-systemd/dnscrypt-proxy.service" ]; then
-    cp -f "$TMP/linux-systemd/dnscrypt-proxy.service" /etc/systemd/system/dnscrypt-proxy.service
-    [ -f "$TMP/linux-systemd/dnscrypt-proxy.socket" ] && cp -f "$TMP/linux-systemd/dnscrypt-proxy.socket" /etc/systemd/system/dnscrypt-proxy.socket 2>/dev/null || true
-    ok "已安装 release 提供的 systemd unit"
+  mkdir -p /etc/dnscrypt-proxy
+  example_path="$(find "$TMP_DIR" -type f -name example-dnscrypt-proxy.toml -print -quit || true)"
+  if [ -z "$example_path" ]; then
+    err "Release 包中未找到 example-dnscrypt-proxy.toml，无法生成可靠配置。"
+    exit 1
+  fi
+
+  cp -f "$example_path" /etc/dnscrypt-proxy/example-dnscrypt-proxy.toml
+  ok "已保存官方示例配置：/etc/dnscrypt-proxy/example-dnscrypt-proxy.toml"
+}
+
+ipv6_available() {
+  if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = "1" ]; then
+    return 1
+  fi
+
+  if [ -s /proc/net/if_inet6 ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+toml_server_names() {
+  local input="$1"
+  local result=""
+  local name
+
+  input="${input//,/ }"
+  for name in $input; do
+    if printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+      if [ -z "$result" ]; then
+        result="'$name'"
+      else
+        result="$result, '$name'"
+      fi
+    fi
+  done
+
+  if [ -z "$result" ]; then
+    result="'cloudflare', 'google'"
+  fi
+
+  printf '[%s]\n' "$result"
+}
+
+replace_or_append_toml() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  if grep -Eq "^[#[:space:]]*${key}[[:space:]]*=" "$file"; then
+    sed -i -E "s|^[#[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$file"
   else
-    info "创建默认 systemd unit"
-    cat >/etc/systemd/system/dnscrypt-proxy.service <<'EOF'
+    printf '\n%s = %s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+write_dnscrypt_config() {
+  local config="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
+  local listen_toml servers_toml ipv6_bool
+
+  cp -f /etc/dnscrypt-proxy/example-dnscrypt-proxy.toml "$config"
+
+  # VPS 本机只需要 IPv4 回环监听。AAAA 查询仍可通过 IPv4 上游返回。
+  listen_toml="['${DNSCRYPT_LISTEN_IPV4}:53']"
+  servers_toml="$(toml_server_names "$DNSCRYPT_SERVERS")"
+
+  if ipv6_available; then
+    ipv6_bool="true"
+    info "检测到系统 IPv6 可用：允许 dnscrypt-proxy 选择 IPv6 上游服务器"
+  else
+    ipv6_bool="false"
+    info "未检测到可用 IPv6：禁用 IPv6 上游服务器，避免精简 VPS 报错"
+  fi
+
+  replace_or_append_toml "$config" "listen_addresses" "$listen_toml"
+  replace_or_append_toml "$config" "server_names" "$servers_toml"
+  replace_or_append_toml "$config" "ipv4_servers" "true"
+  replace_or_append_toml "$config" "ipv6_servers" "$ipv6_bool"
+  replace_or_append_toml "$config" "dnscrypt_servers" "true"
+  replace_or_append_toml "$config" "doh_servers" "true"
+  replace_or_append_toml "$config" "odoh_servers" "false"
+  replace_or_append_toml "$config" "require_dnssec" "true"
+  replace_or_append_toml "$config" "require_nolog" "false"
+  replace_or_append_toml "$config" "require_nofilter" "false"
+  replace_or_append_toml "$config" "cache" "true"
+  replace_or_append_toml "$config" "cache_size" "2048"
+  replace_or_append_toml "$config" "cache_min_ttl" "600"
+  replace_or_append_toml "$config" "cache_max_ttl" "86400"
+  replace_or_append_toml "$config" "bootstrap_resolvers" "['1.1.1.1:53', '8.8.8.8:53', '9.9.9.9:53']"
+  replace_or_append_toml "$config" "ignore_system_dns" "true"
+  replace_or_append_toml "$config" "netprobe_timeout" "30"
+  replace_or_append_toml "$config" "log_level" "2"
+  replace_or_append_toml "$config" "use_syslog" "true"
+
+  chmod 0644 "$config"
+  ok "已生成配置：$config"
+}
+
+write_systemd_unit() {
+  systemctl disable --now dnscrypt-proxy.socket >/dev/null 2>&1 || true
+  systemctl stop dnscrypt-proxy >/dev/null 2>&1 || true
+
+  cat > /etc/systemd/system/dnscrypt-proxy.service <<'EOF'
 [Unit]
 Description=DNSCrypt client proxy
-After=network.target
+Documentation=https://github.com/DNSCrypt/dnscrypt-proxy
+Wants=network-online.target
+After=network-online.target
 
 [Service]
+Type=simple
+WorkingDirectory=/etc/dnscrypt-proxy
 ExecStart=/usr/local/bin/dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=1048576
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    ok "已创建默认 systemd unit"
-  fi
 
-  systemctl daemon-reload || true
-  rm -rf "$TMP" || true
-  return 0
+  systemctl daemon-reload
+  ok "已写入 systemd unit：/etc/systemd/system/dnscrypt-proxy.service"
 }
 
-# ------------------------ dnsmasq 检测并卸载 ------------------------
-remove_dnsmasq_if_exists() {
-  if dpkg -s dnsmasq >/dev/null 2>&1 || command -v dnsmasq >/dev/null 2>&1; then
-    info "检测到 dnsmasq，正在卸载（无备份）..."
-    # 停止并卸载
-    systemctl stop dnsmasq 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y dnsmasq || true
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y --purge || true
-    ok "dnsmasq 已卸载（若之前未安装则忽略）"
-  else
-    ok "未检测到 dnsmasq"
-  fi
+service_logs() {
+  journalctl -u dnscrypt-proxy --no-pager -n 120 -o cat 2>/dev/null || true
 }
 
-# ------------------------ v3 列表与 minisign 下载 ------------------------
-download_v3_files() {
-  info "下载 v3 列表、.minisig 文件与 minisign.pub（优先使用 download.dnscrypt.info 镜像）"
-  mkdir -p /etc/dnscrypt-proxy
-  local base="https://download.dnscrypt.info/dnscrypt-resolvers/v3"
-  local curl_opts="--retry 3 --connect-timeout 8 --max-time 30 -fsSL"
-  for f in public-resolvers relays; do
-    if curl $curl_opts -o /etc/dnscrypt-proxy/${f}.md "${base}/${f}.md"; then
-      ok "下载 /etc/dnscrypt-proxy/${f}.md"
-    else
-      warn "下载 ${f}.md 失败（尝试回退到 GitHub raw）"
-      if curl $curl_opts -o /etc/dnscrypt-proxy/${f}.md "https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/${f}.md"; then
-        ok "回退下载成功：/etc/dnscrypt-proxy/${f}.md"
-      else
-        warn "回退下载 ${f}.md 也失败，继续（后续可能使用回退解析）"
-      fi
+start_and_test_dnscrypt() {
+  local attempt
+
+  info "启动 dnscrypt-proxy"
+  systemctl enable dnscrypt-proxy >/dev/null 2>&1
+  systemctl restart dnscrypt-proxy || true
+  sleep 4
+
+  if ! systemctl is-active --quiet dnscrypt-proxy; then
+    warn "首次启动失败，检查是否为端口冲突"
+    service_logs | tail -n 80 >&2 || true
+
+    if service_logs | grep -Eqi 'address already in use|bind'; then
+      warn "检测到端口绑定失败，切换监听地址到 127.0.3.1 后重试"
+      DNSCRYPT_LISTEN_IPV4="127.0.3.1"
+      write_dnscrypt_config
+      systemctl restart dnscrypt-proxy || true
+      sleep 4
     fi
-    # minisig
-    if curl $curl_opts -o /etc/dnscrypt-proxy/${f}.md.minisig "${base}/${f}.md.minisig"; then
-      ok "下载 /etc/dnscrypt-proxy/${f}.md.minisig"
-    else
-      warn "下载 ${f}.md.minisig 失败（非致命）"
+  fi
+
+  if ! systemctl is-active --quiet dnscrypt-proxy; then
+    err "dnscrypt-proxy 未能启动。未修改 /etc/resolv.conf。最近日志如下："
+    service_logs >&2 || true
+    exit 1
+  fi
+
+  info "测试本地 DNSCrypt 解析"
+  for attempt in 1 2 3; do
+    if dig @"$DNSCRYPT_LISTEN_IPV4" debian.org A +time=5 +tries=1 +short | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      ok "本地 DNSCrypt 解析测试通过：@$DNSCRYPT_LISTEN_IPV4"
+      return 0
     fi
+    warn "解析测试第 ${attempt} 次失败，等待后重试"
+    sleep 3
+    systemctl restart dnscrypt-proxy || true
+    sleep 3
   done
 
-  if curl $curl_opts -o /etc/dnscrypt-proxy/minisign.pub "${base}/minisign.pub"; then
-    ok "下载 /etc/dnscrypt-proxy/minisign.pub"
-  else
-    warn "下载 minisign.pub 失败（可能网络受限）"
-  fi
-
-  chmod 644 /etc/dnscrypt-proxy/*.md* /etc/dnscrypt-proxy/minisign.pub 2>/dev/null || true
-  chown root:root /etc/dnscrypt-proxy/*.md* /etc/dnscrypt-proxy/minisign.pub 2>/dev/null || true
-}
-
-# ------------------------ 提取 minisign_key 并写配置 ------------------------
-extract_minisign_key() {
-  local file="/etc/dnscrypt-proxy/minisign.pub"
-  if [ ! -f "$file" ]; then
-    return 1
-  fi
-  local key
-  key=$(grep -Eo '[A-Za-z0-9+/=]{20,}' "$file" | head -n1 || true)
-  if [ -z "$key" ]; then
-    return 2
-  fi
-  printf '%s' "$key"
-  return 0
-}
-
-write_v3_config_with_key() {
-  local key="$1"
-  info "写入 v3 配置并设置 minisign_key（覆盖 /etc/dnscrypt-proxy/dnscrypt-proxy.toml）"
-  # 原子写入
-  tmpf="$(mktemp)"
-  cat >"$tmpf" <<EOF
-# 自动生成的 dnscrypt-proxy v3 配置（可按需修改）
-listen_addresses = ['127.0.2.1:53', '[::1]:53']
-server_names = ['cloudflare','google']
-doh_servers = true
-require_dnssec = true
-
-cache = true
-cache_size = 2048
-cache_min_ttl = 600
-cache_max_ttl = 86400
-
-[sources.'public-resolvers']
-urls = ['https://download.dnscrypt.info/dnscrypt-resolvers/v3/public-resolvers.md']
-cache_file = 'public-resolvers.md'
-refresh_delay = 72
-minisign_key = "$key"
-
-[sources.'relays']
-urls = ['https://download.dnscrypt.info/dnscrypt-resolvers/v3/relays.md']
-cache_file = 'relays.md'
-refresh_delay = 168
-minisign_key = "$key"
-EOF
-  mv "$tmpf" /etc/dnscrypt-proxy/dnscrypt-proxy.toml
-  chmod 644 /etc/dnscrypt-proxy/dnscrypt-proxy.toml
-  ok "配置已写入 /etc/dnscrypt-proxy/dnscrypt-proxy.toml"
-}
-
-# ------------------------ 应急回退配置（无签名时使用） ------------------------
-write_emergency_config() {
-  info "写入应急回退配置（fallback_resolvers），确保系统始终能解析"
-  cat >/etc/dnscrypt-proxy/dnscrypt-proxy.toml <<'EOF'
-# Emergency fallback config — ensures dnscrypt-proxy runs even if sources fail
-listen_addresses = ['127.0.2.1:53']
-server_names = []
-fallback_resolvers = ['1.1.1.1:53','8.8.8.8:53']
-cache = true
-cache_size = 2048
-cache_min_ttl = 600
-cache_max_ttl = 86400
-EOF
-  ok "应急回退配置已写入"
-}
-
-# ------------------------ 端口冲突处理 ------------------------
-handle_port_conflict_or_start() {
-  # 尝试启动 service 并查看是否 active，如果因端口冲突失败，尝试停止常见服务；若不能释放端口，改用备用地址
-  systemctl daemon-reload || true
-  systemctl enable --now dnscrypt-proxy || true
-  sleep 1
-
-  if systemctl is-active --quiet dnscrypt-proxy; then
-    ok "dnscrypt-proxy 服务已启动"
-    return 0
-  fi
-
-  # 检查 journal 中是否包含 bind error / address already in use
-  if journalctl -u dnscrypt-proxy -n 40 -o cat | grep -qi 'bind: address already in use'; then
-    warn "dnscrypt-proxy 启动失败：端口 127.0.2.1:53 被占用，尝试找出占用进程并停止（常见者：dnsmasq, systemd-resolved, unbound, bind9）"
-    # 使用 ss 查找占用进程（UDP/TCP）
-    local occ
-    occ=$(ss -ltnup 2>/dev/null | grep -E ':53\b' -n || true)
-    log "占用 53 的进程信息："
-    log "$occ"
-    # 尝试停止常见服务
-    local services=(dnsmasq systemd-resolved unbound bind9 named)
-    for s in "${services[@]}"; do
-      if systemctl is-active --quiet "$s" 2>/dev/null || systemctl is-enabled --quiet "$s" 2>/dev/null; then
-        warn "检测到并尝试停止 $s"
-        systemctl stop "$s" 2>/dev/null || true
-        sleep 1
-      fi
-    done
-
-    # 再次尝试启动 dnscrypt-proxy
-    systemctl restart dnscrypt-proxy || true
-    sleep 1
-    if systemctl is-active --quiet dnscrypt-proxy; then
-      ok "停止冲突服务后 dnscrypt-proxy 已成功启动"
-      return 0
-    fi
-
-    # 如果仍然没有启动，改用备用回环地址 127.0.3.1:53 并重写配置
-    warn "仍然无法释放端口，改用备用回环地址 127.0.3.1:53 并重启 dnscrypt-proxy"
-    # 备份旧配置并原子替换 listen_addresses
-    if [ -f /etc/dnscrypt-proxy/dnscrypt-proxy.toml ]; then
-      cp -f /etc/dnscrypt-proxy/dnscrypt-proxy.toml /etc/dnscrypt-proxy/dnscrypt-proxy.toml.bak.$(date +%s) || true
-    fi
-    tmpf=$(mktemp)
-    # 将 listen_addresses 替换为备用地址（简单方式：生成 new minimal config preserving server_names）
-    # 尝试从旧配置读取 server_names，否则使用 cloudflare,google
-    local sn
-    sn=$(grep -E "^server_names" -n /etc/dnscrypt-proxy/dnscrypt-proxy.toml 2>/dev/null | head -n1 | sed -E "s/.*=//" | tr -d "[:space:]" || true)
-    if [ -z "$sn" ]; then sn="['cloudflare','google']"; fi
-    cat >"$tmpf" <<EOF
-# 自动切换到备用回环地址，因为 127.0.2.1:53 被占用
-listen_addresses = ['127.0.3.1:53', '[::1]:53']
-server_names = $sn
-doh_servers = true
-require_dnssec = true
-cache = true
-cache_size = 2048
-cache_min_ttl = 600
-cache_max_ttl = 86400
-[sources.'public-resolvers']
-urls = ['https://download.dnscrypt.info/dnscrypt-resolvers/v3/public-resolvers.md']
-cache_file = 'public-resolvers.md'
-refresh_delay = 72
-# 如果有 minisign_key，脚本会在后面尝试添加
-EOF
-    mv "$tmpf" /etc/dnscrypt-proxy/dnscrypt-proxy.toml
-    systemctl daemon-reload || true
-    systemctl restart dnscrypt-proxy || true
-    sleep 1
-    if systemctl is-active --quiet dnscrypt-proxy; then
-      ok "dnscrypt-proxy 已监听在 127.0.3.1:53"
-      # 切换 resolv 指向 127.0.3.1
-      set_resolv_to_local "127.0.3.1"
-      return 0
-    else
-      err "即使切换到备用地址 dnscrypt-proxy 仍未能启动，请查看日志：journalctl -u dnscrypt-proxy -n 200 -o cat"
-      return 1
-    fi
-  else
-    # 不是端口占用问题，输出日志帮助诊断
-    err "dnscrypt-proxy 无法启动，请查看日志以获取详细原因"
-    journalctl -u dnscrypt-proxy -n 200 -o cat | tee -a "$logfile"
-    return 1
-  fi
-}
-
-# ------------------------ 修改 /etc/resolv.conf 指向本地并尝试写保护 ------------------------
-set_resolv_to_local() {
-  local addr="$1"
-  info "覆盖 /etc/resolv.conf 指向本地 DNS: $addr"
-  # 取消 immutable（以免写入被阻止）
-  if command -v chattr >/dev/null 2>&1; then
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-  fi
-  cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%s) 2>/dev/null || true
-  cat >/etc/resolv.conf <<EOF
-nameserver $addr
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
-  # 仅当系统似乎不使用 NetworkManager 或 systemd-resolved 来写 resolv.conf 时才锁定
-  if ! (systemctl is-active --quiet NetworkManager 2>/dev/null || systemctl is-active --quiet systemd-resolved 2>/dev/null); then
-    if command -v chattr >/dev/null 2>&1; then
-      chattr +i /etc/resolv.conf 2>/dev/null || true
-      ok "/etc/resolv.conf 已覆盖并尝试写保护 (chattr +i)"
-    else
-      warn "系统没有 chattr 命令，已覆盖 /etc/resolv.conf 但无法写保护"
-    fi
-  else
-    warn "检测到 NetworkManager 或 systemd-resolved 正在运行，已覆盖 /etc/resolv.conf 但未尝试写保护（以避免冲突）"
-  fi
-}
-
-# ------------------------ 每周维护脚本安装 ------------------------
-install_weekly_maintenance() {
-  info "安装每周维护脚本到 /etc/cron.weekly/（每周更新 v3 列表与签名）"
-  cat >/usr/local/bin/dnscrypt-maint.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-LOG=/var/log/dnscrypt-maint.log
-echo "$(date '+%F %T') dnscrypt-maint: 开始" >>"$LOG"
-base="https://download.dnscrypt.info/dnscrypt-resolvers/v3"
-tmpdir=$(mktemp -d)
-cd "$tmpdir"
-for f in public-resolvers relays; do
-  curl -fsSL -o "${f}.md.new" "${base}/${f}.md" || continue
-  curl -fsSL -o "${f}.md.new.minisig" "${base}/${f}.md.minisig" || true
-  if [ -f "${f}.md.new" ]; then
-    if ! cmp -s "${f}.md.new" "/etc/dnscrypt-proxy/${f}.md" 2>/dev/null; then
-      mv "${f}.md.new" "/etc/dnscrypt-proxy/${f}.md"
-      mv "${f}.md.new.minisig" "/etc/dnscrypt-proxy/${f}.md.minisig" 2>/dev/null || true
-      echo "$(date '+%F %T') dnscrypt-maint: 更新 ${f}.md" >>"$LOG"
-      updated=1
-    else
-      echo "$(date '+%F %T') dnscrypt-maint: ${f}.md 无变化" >>"$LOG"
-    fi
-  fi
-done
-# 更新 minisign.pub
-curl -fsSL -o /etc/dnscrypt-proxy/minisign.pub "${base}/minisign.pub" || true
-# 如果有更新则重启服务
-if [ "${updated:-0}" -eq 1 ]; then
-  systemctl restart dnscrypt-proxy || true
-  echo "$(date '+%F %T') dnscrypt-maint: dnscrypt-proxy 已重启" >>"$LOG"
-fi
-rm -rf "$tmpdir"
-echo "$(date '+%F %T') dnscrypt-maint: 结束" >>"$LOG"
-EOF
-  chmod 0755 /usr/local/bin/dnscrypt-maint.sh
-  # 放到 cron.weekly（覆盖幂等）
-  cat >/etc/cron.weekly/dnscrypt-maint <<'EOF'
-#!/bin/sh
-/usr/local/bin/dnscrypt-maint.sh >/dev/null 2>&1
-EOF
-  chmod 0755 /etc/cron.weekly/dnscrypt-maint
-  ok "每周维护脚本已安装（/etc/cron.weekly/dnscrypt-maint）"
-}
-
-# ------------------------ 主流程 ------------------------
-ensure_tools
-
-DIST_INFO=$(detect_distro)
-DIST_ID=${DIST_INFO%%|*}
-DIST_VER=${DIST_INFO##*|}
-info "检测到发行版: id=${DIST_ID}, version=${DIST_VER}"
-
-# 决定是否尝试 apt
-use_apt=0
-if [ "$DIST_ID" = "debian" ]; then
-  if [ "$DIST_VER" = "13" ] || echo "$DIST_VER" | grep -qi 'trixie' 2>/dev/null; then
-    use_apt=1
-    info "Debian 13 (trixie) 将优先使用 apt 安装 dnscrypt-proxy"
-  else
-    use_apt=0
-    info "Debian ${DIST_VER} 跳过 apt，使用 GitHub Releases 安装 dnscrypt-proxy"
-  fi
-elif [ "$DIST_ID" = "ubuntu" ]; then
-  use_apt=1
-  info "Ubuntu 系统：先尝试 apt，失败则回退为 GitHub Releases"
-else
-  use_apt=0
-  info "非 Debian/Ubuntu 系统：使用 GitHub Releases 安装 dnscrypt-proxy"
-fi
-
-# 卸载 dnsmasq（按你指定，直接卸载、不备份）
-remove_dnsmasq_if_exists
-
-# 安装 dnscrypt-proxy（apt 或 github）
-installed_via_apt=0
-if [ "$use_apt" -eq 1 ]; then
-  if try_apt_install; then
-    installed_via_apt=1
-  else
-    install_from_github
-  fi
-else
-  install_from_github
-fi
-
-# 确保 /etc/dnscrypt-proxy 目录
-mkdir -p /etc/dnscrypt-proxy
-chmod 755 /etc/dnscrypt-proxy
-
-# 先写应急配置以保证解析不中断（会被后续更完善配置覆盖）
-write_emergency_config
-
-# 下载 v3 列表与 minisign
-download_v3_files
-
-# 尝试提取 minisign_key
-MINISIGN_KEY=""
-if MINISIGN_KEY=$(extract_minisign_key); then
-  ok "已提取 minisign_key: $MINISIGN_KEY"
-  write_v3_config_with_key "$MINISIGN_KEY"
-else
-  warn "未能提取 minisign_key（网络或文件问题）。将保留应急回退配置并尝试离线恢复方案"
-  # 尝试写入 minimal cloudflare 条目以使 server_names 可用（离线方案，不做签名校验）
-  cat >/etc/dnscrypt-proxy/public-resolvers.md <<'EOF'
-## cloudflare
-Cloudflare DNS (DoH) minimal offline entry
-sdns://AgcAAAAAAAAADzE1Mi4xMDkuMjQyLjIwOQovZG9oL2NlcnQ
-EOF
-  warn "已写入离线 cloudflare minimal 条目到 /etc/dnscrypt-proxy/public-resolvers.md"
-  # 覆盖 config 指向 cloudflare
-  cat >/etc/dnscrypt-proxy/dnscrypt-proxy.toml <<'EOF'
-listen_addresses = ['127.0.2.1:53']
-server_names = ['cloudflare']
-doh_servers = true
-require_dnssec = true
-cache = true
-cache_size = 2048
-cache_min_ttl = 600
-cache_max_ttl = 86400
-EOF
-  warn "已写入离线配置，dnscrypt-proxy 将以 cloudflare（离线）工作"
-fi
-
-# 启动并处理端口冲突
-if handle_port_conflict_or_start; then
-  ok "dnscrypt-proxy 已部署并尝试启动"
-else
-  err "dnscrypt-proxy 未能成功启动，请查阅日志：journalctl -u dnscrypt-proxy -n 200 -o cat"
-fi
-
-# 设置系统解析为本地 dnscrypt（优先 127.0.2.1；如果脚本切换为 127.0.3.1 则 handle_port_conflict_or_start 已设置）
-# 若 dnscrypt-proxy 在 127.0.3.1 上监听则检测并使用
-if ss -ltnup 2>/dev/null | grep -q '127.0.3.1:53'; then
-  set_resolv_to_local "127.0.3.1"
-else
-  set_resolv_to_local "127.0.2.1"
-fi
-
-# 安装每周维护脚本
-install_weekly_maintenance
-
-# 最后输出状态与日志片段
-systemctl status dnscrypt-proxy --no-pager -l || true
-journalctl -u dnscrypt-proxy -n 120 -o cat | sed -n '1,200p' >> "$logfile" || true
-
-if systemctl is-active --quiet dnscrypt-proxy; then
-  ok "全部完成：dnscrypt-proxy 已运行 (active)。建议观察 24 小时以确认稳定性。"
-  ok "每周维护脚本已安装到 /etc/cron.weekly/dnscrypt-maint（每周运行一次）"
-  ok "日志文件：$logfile"
-  exit 0
-else
-  err "安装完成但 dnscrypt-proxy 未处于 active。请查看日志：journalctl -u dnscrypt-proxy -n 200 -o cat"
-  err "日志文件：$logfile"
+  err "dnscrypt-proxy 已启动，但解析测试失败。未修改 /etc/resolv.conf。最近日志如下："
+  service_logs >&2 || true
   exit 1
+}
+
+write_resolv_conf() {
+  local resolv="/etc/resolv.conf"
+
+  info "写入系统 DNS：$resolv -> $DNSCRYPT_LISTEN_IPV4"
+
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$resolv" 2>/dev/null || true
+  fi
+
+  cp -a "$resolv" "$BACKUP_DIR/resolv.conf.before-dnscrypt" 2>/dev/null || true
+
+  if [ -L "$resolv" ]; then
+    rm -f "$resolv"
+  fi
+
+  cat > "$resolv" <<EOF
+nameserver $DNSCRYPT_LISTEN_IPV4
+options timeout:2 attempts:2
+EOF
+
+  chmod 0644 "$resolv"
+
+  if [ "$LOCK_RESOLV" = "1" ]; then
+    if command -v chattr >/dev/null 2>&1; then
+      chattr +i "$resolv" 2>/dev/null || warn "尝试 chattr +i $resolv 失败，可能是文件系统不支持。"
+      ok "已尝试锁定 $resolv"
+    else
+      warn "未找到 chattr，无法锁定 $resolv"
+    fi
+  fi
+
+  ok "系统 DNS 已指向本地 dnscrypt-proxy"
+}
+
+final_system_dns_test() {
+  info "测试系统默认 DNS 解析"
+
+  if getent ahostsv4 debian.org >/dev/null 2>&1; then
+    ok "系统默认 DNS 解析正常"
+  else
+    err "系统默认 DNS 解析失败。尝试恢复安装前 resolv.conf。"
+    if [ -f "$BACKUP_DIR/resolv.conf.before-dnscrypt" ]; then
+      if command -v chattr >/dev/null 2>&1; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+      fi
+      cp -a "$BACKUP_DIR/resolv.conf.before-dnscrypt" /etc/resolv.conf
+      warn "已恢复旧 /etc/resolv.conf：$BACKUP_DIR/resolv.conf.before-dnscrypt"
+    fi
+    exit 1
+  fi
+}
+
+install_healthcheck_timer() {
+  cat > /usr/local/sbin/dnscrypt-proxy-healthcheck <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LOG=/var/log/dnscrypt-healthcheck.log
+LISTEN_ADDR="${DNSCRYPT_LISTEN_IPV4:-127.0.2.1}"
+
+if grep -q '^nameserver 127\.0\.3\.1' /etc/resolv.conf 2>/dev/null; then
+  LISTEN_ADDR="127.0.3.1"
 fi
+
+if dig @"$LISTEN_ADDR" debian.org A +time=5 +tries=1 +short >/dev/null 2>&1; then
+  echo "$(date '+%F %T') ok @$LISTEN_ADDR" >> "$LOG"
+  exit 0
+fi
+
+echo "$(date '+%F %T') restart dnscrypt-proxy; healthcheck failed @$LISTEN_ADDR" >> "$LOG"
+systemctl restart dnscrypt-proxy || true
+sleep 5
+if dig @"$LISTEN_ADDR" debian.org A +time=5 +tries=1 +short >/dev/null 2>&1; then
+  echo "$(date '+%F %T') ok after restart @$LISTEN_ADDR" >> "$LOG"
+else
+  echo "$(date '+%F %T') still failed @$LISTEN_ADDR" >> "$LOG"
+fi
+EOF
+  chmod 0755 /usr/local/sbin/dnscrypt-proxy-healthcheck
+
+  cat > /etc/systemd/system/dnscrypt-proxy-healthcheck.service <<'EOF'
+[Unit]
+Description=DNSCrypt proxy health check
+After=dnscrypt-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dnscrypt-proxy-healthcheck
+EOF
+
+  cat > /etc/systemd/system/dnscrypt-proxy-healthcheck.timer <<'EOF'
+[Unit]
+Description=Run DNSCrypt proxy health check daily
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now dnscrypt-proxy-healthcheck.timer >/dev/null 2>&1 || warn "健康检查 timer 启用失败，不影响 dnscrypt-proxy 主服务。"
+  ok "已安装 systemd 健康检查 timer"
+}
+
+print_summary() {
+  echo
+  ok "dnscrypt-proxy 安装完成"
+  echo "监听地址：$DNSCRYPT_LISTEN_IPV4:53"
+  echo "上游服务器：$DNSCRYPT_SERVERS"
+  echo "配置文件：/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
+  echo "备份目录：$BACKUP_DIR"
+  echo "安装日志：$LOG_FILE"
+  echo
+  echo "常用命令："
+  echo "  systemctl status dnscrypt-proxy --no-pager -l"
+  echo "  journalctl -u dnscrypt-proxy -n 100 -o cat"
+  echo "  dig @$DNSCRYPT_LISTEN_IPV4 debian.org A +short"
+  echo
+  echo "如需锁定 /etc/resolv.conf，可重新运行："
+  echo "  LOCK_RESOLV=1 bash install-dnscrypt-universal.sh"
+}
+
+main() {
+  touch "$LOG_FILE"
+  require_root
+  require_debian_systemd
+  backup_existing_files
+  install_dependencies
+  install_dnscrypt_from_github
+  write_dnscrypt_config
+  write_systemd_unit
+  start_and_test_dnscrypt
+  write_resolv_conf
+  final_system_dns_test
+  install_healthcheck_timer
+  print_summary
+}
+
+main "$@"
