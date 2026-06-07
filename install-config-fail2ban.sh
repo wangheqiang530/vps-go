@@ -48,9 +48,9 @@ LAST_STEP_TS="$SCRIPT_START_TS"
 backup_path="/root/fail2ban-backup-$(date +%Y%m%d-%H%M%S)"
 
 APT_DPKG_OPTIONS=(
-  -o Dpkg::Use-Pty=0
-  -o Dpkg::Options::=--force-confdef
-  -o Dpkg::Options::=--force-confold
+  "-o" "Dpkg::Use-Pty=0"
+  "-o" "Dpkg::Options::=--force-confdef"
+  "-o" "Dpkg::Options::=--force-confold"
 )
 
 banner() {
@@ -77,6 +77,14 @@ mark_step() {
   ok "$msg，用时 ${delta}s"
 }
 
+apt_get_noninteractive() {
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" "$@" < <(yes N)
+}
+
+dpkg_configure_noninteractive() {
+  DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a < <(yes N)
+}
+
 backup_configs() {
   mkdir -p "$backup_path"
 
@@ -96,7 +104,8 @@ backup_configs() {
 repair_dpkg_if_needed() {
   if dpkg --audit 2>/dev/null | grep -q .; then
     warn "检测到存在未配置完成的软件包，先尝试非交互修复 dpkg/apt 状态"
-    DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
+    dpkg_configure_noninteractive || true
+    apt_get_noninteractive -f install -y
     mark_step "dpkg/apt 状态修复完成"
   fi
 }
@@ -105,17 +114,29 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
 
   info "更新软件源"
-  apt-get update -y
+  apt_get_noninteractive update -y
 
   repair_dpkg_if_needed
 
   info "安装 Fail2Ban 与精简系统必需依赖"
-  apt-get "${APT_DPKG_OPTIONS[@]}" install -y --no-install-recommends \
+  if ! apt_get_noninteractive install -y --no-install-recommends \
     fail2ban \
     python3-systemd \
     nftables \
     iptables \
-    ca-certificates
+    ca-certificates; then
+    warn "apt-get 安装阶段失败，尝试先修复 dpkg 半配置状态后重试"
+    dpkg_configure_noninteractive || true
+    apt_get_noninteractive -f install -y || true
+    apt_get_noninteractive install -y --no-install-recommends \
+      fail2ban \
+      python3-systemd \
+      nftables \
+      iptables \
+      ca-certificates
+  fi
+
+  repair_dpkg_if_needed
 
   if ! python3 - <<'PY' >/dev/null 2>&1
 import systemd.journal
