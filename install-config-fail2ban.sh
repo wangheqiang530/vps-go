@@ -6,6 +6,7 @@ IFS=$'\n\t'
 # 作用：为 Debian 11/12/13 与 Ubuntu 精简 VPS 自动安装并加固 Fail2Ban SSH 防护。
 # 特点：
 # - 自动安装必需依赖：fail2ban、python3-systemd、nftables、iptables
+# - apt/dpkg 全程非交互，遇到包内配置文件冲突时默认保留当前文件，避免管道执行中断
 # - 使用 systemd journal 读取 sshd 日志，不依赖 /var/log/auth.log 或 rsyslog
 # - 备份并隔离旧本地配置，支持在旧机器上覆盖安装/更新/加固
 # - SSH jail 使用 aggressive 模式，覆盖更多扫描、异常握手、预认证断开行为
@@ -45,6 +46,12 @@ err() { printf '%b[ERROR]%b %s\n' "$COL_ERR" "$COL_RESET" "$*" >&2; }
 SCRIPT_START_TS="$(date +%s)"
 LAST_STEP_TS="$SCRIPT_START_TS"
 backup_path="/root/fail2ban-backup-$(date +%Y%m%d-%H%M%S)"
+
+APT_DPKG_OPTIONS=(
+  -o Dpkg::Use-Pty=0
+  -o Dpkg::Options::=--force-confdef
+  -o Dpkg::Options::=--force-confold
+)
 
 banner() {
   cat <<'EOF_BANNER'
@@ -86,14 +93,24 @@ backup_configs() {
   mark_step "已备份旧配置到：$backup_path"
 }
 
+repair_dpkg_if_needed() {
+  if dpkg --audit 2>/dev/null | grep -q .; then
+    warn "检测到存在未配置完成的软件包，先尝试非交互修复 dpkg/apt 状态"
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
+    mark_step "dpkg/apt 状态修复完成"
+  fi
+}
+
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
 
   info "更新软件源"
   apt-get update -y
 
+  repair_dpkg_if_needed
+
   info "安装 Fail2Ban 与精简系统必需依赖"
-  apt-get install -y --no-install-recommends \
+  apt-get "${APT_DPKG_OPTIONS[@]}" install -y --no-install-recommends \
     fail2ban \
     python3-systemd \
     nftables \
