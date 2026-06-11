@@ -50,6 +50,30 @@ require_root() {
   fi
 }
 
+validate_listen_ipv4() {
+  local IFS=.
+  local -a octets
+  local octet
+
+  if [[ ! "$DNSCRYPT_LISTEN_IPV4" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    err "DNSCRYPT_LISTEN_IPV4 不是有效 IPv4 地址：$DNSCRYPT_LISTEN_IPV4"
+    exit 1
+  fi
+
+  read -r -a octets <<< "$DNSCRYPT_LISTEN_IPV4"
+  if [ "${#octets[@]}" -ne 4 ] || [ "${octets[0]}" != "127" ]; then
+    err "DNSCRYPT_LISTEN_IPV4 必须使用 127.0.0.0/8 回环地址，当前为：$DNSCRYPT_LISTEN_IPV4"
+    exit 1
+  fi
+
+  for octet in "${octets[@]}"; do
+    if (( 10#$octet > 255 )); then
+      err "DNSCRYPT_LISTEN_IPV4 包含无效段：$DNSCRYPT_LISTEN_IPV4"
+      exit 1
+    fi
+  done
+}
+
 require_debian_systemd() {
   if ! command -v apt-get >/dev/null 2>&1; then
     err "未找到 apt-get。此脚本仅面向 Debian/Ubuntu 系系统。"
@@ -84,6 +108,8 @@ backup_existing_files() {
     /etc/systemd/system/dnscrypt-proxy.socket \
     /etc/systemd/system/dnscrypt-proxy-healthcheck.service \
     /etc/systemd/system/dnscrypt-proxy-healthcheck.timer \
+    /usr/local/bin/dnscrypt-proxy \
+    /usr/local/sbin/dnscrypt-proxy-healthcheck \
     /etc/resolv.conf; do
     if [ -e "$item" ] || [ -L "$item" ]; then
       cp -a "$item" "$BACKUP_DIR/" 2>/dev/null || true
@@ -196,7 +222,7 @@ ipv6_available() {
     return 1
   fi
 
-  if [ -s /proc/net/if_inet6 ]; then
+  if command -v ip >/dev/null 2>&1 && ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
     return 0
   fi
 
@@ -208,34 +234,70 @@ toml_server_names() {
   local result=""
   local name
 
-  input="${input//,/ }"
-  for name in $input; do
-    if printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+  while IFS= read -r name; do
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    if [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
       if [ -z "$result" ]; then
         result="'$name'"
       else
         result="$result, '$name'"
       fi
+    elif [ -n "$name" ]; then
+      warn "忽略非法 DNSCrypt server 名称：$name" >&2
     fi
-  done
+  done < <(printf '%s\n' "$input" | tr ',' '\n')
 
   if [ -z "$result" ]; then
+    warn "未解析到有效 DNSCrypt server 名称，回退到 cloudflare,google" >&2
     result="'cloudflare', 'google'"
   fi
 
   printf '[%s]\n' "$result"
 }
 
-replace_or_append_toml() {
+set_top_level_toml() {
   local file="$1"
   local key="$2"
   local value="$3"
+  local tmp
 
-  if grep -Eq "^[#[:space:]]*${key}[[:space:]]*=" "$file"; then
-    sed -i -E "s|^[#[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$file"
-  else
-    printf '\n%s = %s\n' "$key" "$value" >> "$file"
-  fi
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN {
+      done = 0
+      in_top_level = 1
+      key_re = "^[[:space:]]*" key "[[:space:]]*="
+    }
+
+    in_top_level && /^[[:space:]]*\[/ {
+      if (!done) {
+        print key " = " value
+        done = 1
+      }
+      in_top_level = 0
+      print
+      next
+    }
+
+    in_top_level && $0 ~ key_re {
+      if (!done) {
+        print key " = " value
+        done = 1
+      }
+      next
+    }
+
+    { print }
+
+    END {
+      if (!done) {
+        print key " = " value
+      }
+    }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
 }
 
 write_dnscrypt_config() {
@@ -256,25 +318,25 @@ write_dnscrypt_config() {
     info "未检测到可用 IPv6：禁用 IPv6 上游服务器，避免精简 VPS 报错"
   fi
 
-  replace_or_append_toml "$config" "listen_addresses" "$listen_toml"
-  replace_or_append_toml "$config" "server_names" "$servers_toml"
-  replace_or_append_toml "$config" "ipv4_servers" "true"
-  replace_or_append_toml "$config" "ipv6_servers" "$ipv6_bool"
-  replace_or_append_toml "$config" "dnscrypt_servers" "true"
-  replace_or_append_toml "$config" "doh_servers" "true"
-  replace_or_append_toml "$config" "odoh_servers" "false"
-  replace_or_append_toml "$config" "require_dnssec" "true"
-  replace_or_append_toml "$config" "require_nolog" "false"
-  replace_or_append_toml "$config" "require_nofilter" "false"
-  replace_or_append_toml "$config" "cache" "true"
-  replace_or_append_toml "$config" "cache_size" "2048"
-  replace_or_append_toml "$config" "cache_min_ttl" "600"
-  replace_or_append_toml "$config" "cache_max_ttl" "86400"
-  replace_or_append_toml "$config" "bootstrap_resolvers" "['1.1.1.1:53', '8.8.8.8:53', '9.9.9.9:53']"
-  replace_or_append_toml "$config" "ignore_system_dns" "true"
-  replace_or_append_toml "$config" "netprobe_timeout" "30"
-  replace_or_append_toml "$config" "log_level" "2"
-  replace_or_append_toml "$config" "use_syslog" "true"
+  set_top_level_toml "$config" "listen_addresses" "$listen_toml"
+  set_top_level_toml "$config" "server_names" "$servers_toml"
+  set_top_level_toml "$config" "ipv4_servers" "true"
+  set_top_level_toml "$config" "ipv6_servers" "$ipv6_bool"
+  set_top_level_toml "$config" "dnscrypt_servers" "true"
+  set_top_level_toml "$config" "doh_servers" "true"
+  set_top_level_toml "$config" "odoh_servers" "false"
+  set_top_level_toml "$config" "require_dnssec" "true"
+  set_top_level_toml "$config" "require_nolog" "false"
+  set_top_level_toml "$config" "require_nofilter" "false"
+  set_top_level_toml "$config" "cache" "true"
+  set_top_level_toml "$config" "cache_size" "2048"
+  set_top_level_toml "$config" "cache_min_ttl" "600"
+  set_top_level_toml "$config" "cache_max_ttl" "86400"
+  set_top_level_toml "$config" "bootstrap_resolvers" "['1.1.1.1:53', '8.8.8.8:53', '9.9.9.9:53']"
+  set_top_level_toml "$config" "ignore_system_dns" "true"
+  set_top_level_toml "$config" "netprobe_timeout" "30"
+  set_top_level_toml "$config" "log_level" "2"
+  set_top_level_toml "$config" "use_syslog" "true"
 
   chmod 0644 "$config"
   ok "已生成配置：$config"
@@ -413,11 +475,8 @@ install_healthcheck_timer() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 LOG=/var/log/dnscrypt-healthcheck.log
-LISTEN_ADDR="${DNSCRYPT_LISTEN_IPV4:-127.0.2.1}"
-
-if grep -q '^nameserver 127\.0\.3\.1' /etc/resolv.conf 2>/dev/null; then
-  LISTEN_ADDR="127.0.3.1"
-fi
+LISTEN_ADDR="$(awk '/^nameserver[[:space:]]+127\./ {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)"
+LISTEN_ADDR="${LISTEN_ADDR:-127.0.2.1}"
 
 if dig @"$LISTEN_ADDR" debian.org A +time=5 +tries=1 +short >/dev/null 2>&1; then
   echo "$(date '+%F %T') ok @$LISTEN_ADDR" >> "$LOG"
@@ -431,6 +490,7 @@ if dig @"$LISTEN_ADDR" debian.org A +time=5 +tries=1 +short >/dev/null 2>&1; the
   echo "$(date '+%F %T') ok after restart @$LISTEN_ADDR" >> "$LOG"
 else
   echo "$(date '+%F %T') still failed @$LISTEN_ADDR" >> "$LOG"
+  exit 1
 fi
 EOF
   chmod 0755 /usr/local/sbin/dnscrypt-proxy-healthcheck
@@ -482,8 +542,9 @@ print_summary() {
 }
 
 main() {
-  touch "$LOG_FILE"
   require_root
+  touch "$LOG_FILE"
+  validate_listen_ipv4
   require_debian_systemd
   backup_existing_files
   install_dependencies
