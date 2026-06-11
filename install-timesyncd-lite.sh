@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# install-ntpdate-daily.sh
+# install-timesyncd-lite.sh
 # 作用：为 Debian 11/12/13 精简 VPS 配置轻量级长期时间同步。
-# 说明：脚本名为兼容旧链接保留；当前实现使用 systemd-timesyncd，不再使用 ntpdate daily timer。
+# 说明：由旧版 install-ntpdate-daily.sh 重构而来；当前实现使用 systemd-timesyncd，不再使用 ntpdate daily timer。
 # 设计目标：
 # - 全自动运行，无交互提示。
 # - 优先使用 systemd-timesyncd，长期轻量防止时间漂移。
@@ -345,7 +345,7 @@ write_timesyncd_config() {
   mkdir -p "$TIMESYNCD_DROPIN_DIR"
 
   cat > "$TIMESYNCD_CONF" <<EOF
-# Managed by install-ntpdate-daily.sh from vps-go.
+# Managed by install-timesyncd-lite.sh from vps-go.
 # Profile: $NTP_PROFILE
 
 [Time]
